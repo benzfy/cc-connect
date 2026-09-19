@@ -82,7 +82,11 @@ func TestCUJ_A8_ImmediateReceiptsDuringStartupAndQueue(t *testing.T) {
 // tested at that adapter's real inbound-event boundary.
 func TestCUJ_A9_ComposedInputThenFollowupAndHistory(t *testing.T) {
 	env := newCUJEnv(t)
-	defer env.engine.Stop()
+	defer func() {
+		if err := env.engine.Stop(); err != nil {
+			t.Errorf("stop engine: %v", err)
+		}
+	}()
 	key := "test:alice"
 	env.engine.ReceiveMessage(env.plat, &Message{
 		SessionKey: key, Platform: "test", MessageID: "combined-reply", UserID: "alice",
@@ -91,11 +95,11 @@ func TestCUJ_A9_ComposedInputThenFollowupAndHistory(t *testing.T) {
 	})
 	session := env.activeSession(key)
 	env.waitFor("one visible answer and persisted combined turn", 2*time.Second, func() bool {
-		return env.sentContains("ok") && len(session.GetHistory(0)) == 2
+		return env.sentContains("ok") && len(session.GetHistory(0)) == 2 && !session.Busy()
 	})
 	env.userSends("alice", "independent followup")
 	env.waitFor("second turn persisted", 2*time.Second, func() bool {
-		return len(session.GetHistory(0)) == 4
+		return len(session.GetHistory(0)) == 4 && !session.Busy()
 	})
 	env.plat.clearSent()
 	env.userSends("alice", "/history")
@@ -1195,6 +1199,11 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	defer func() {
+		if err := e.Stop(); err != nil {
+			t.Errorf("stop engine: %v", err)
+		}
+	}()
 
 	msg := &Message{
 		SessionKey: "test:img", Platform: "test", MessageID: "img1",
@@ -1204,13 +1213,16 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 		ReplyCtx: "ctx",
 	}
 	e.ReceiveMessage(plat, msg)
+	session := e.sessions.GetOrCreateActive(msg.SessionKey)
 
 	deadline := time.After(2 * time.Second)
 	for {
 		agent.mu.Lock()
 		n := len(agent.sessions)
 		agent.mu.Unlock()
-		if n > 0 {
+		// Session creation precedes asynchronous history writes. Wait for the
+		// completed turn before TempDir cleanup can remove the session store.
+		if n > 0 && !session.Busy() && len(plat.getSent()) > 0 {
 			break
 		}
 		select {
@@ -1259,6 +1271,11 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	defer func() {
+		if err := e.Stop(); err != nil {
+			t.Errorf("stop engine: %v", err)
+		}
+	}()
 
 	msg := &Message{
 		SessionKey: "test:file", Platform: "test", MessageID: "f1",
@@ -1268,13 +1285,15 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 		ReplyCtx: "ctx",
 	}
 	e.ReceiveMessage(plat, msg)
+	session := e.sessions.GetOrCreateActive(msg.SessionKey)
 
 	deadline := time.After(2 * time.Second)
 	for {
 		agent.mu.Lock()
 		n := len(agent.sessions)
 		agent.mu.Unlock()
-		if n > 0 {
+		// Do not race TempDir cleanup against the turn's history persistence.
+		if n > 0 && !session.Busy() && len(plat.getSent()) > 0 {
 			return
 		}
 		select {
